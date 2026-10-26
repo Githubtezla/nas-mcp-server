@@ -1,0 +1,71 @@
+name: nas-mcp-server
+
+# Your own MCP server for Claude, on your NAS, reachable only through Cloudflare Tunnel + Access.
+# No port is published. Settings come from .env (copy .env.example), the tunnel token from
+# secrets/cf_tunnel_token. See README for the Cloudflare part.
+networks:
+  edge: {}            # mcp needs outbound HTTPS for Cloudflare's signing keys, cloudflared for the tunnel
+
+services:
+  # Runs once on every start: data folder for the server user (uid 10001),
+  # tunnel token copy readable only for cloudflared (uid 65532).
+  fixperms:
+    image: busybox:1.37.0
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /proj/data /proj/secrets/cf
+        chown -R 10001:10001 /proj/data
+        chmod 0700 /proj/data
+        rm -f /proj/secrets/cf/*
+        if [ -f /proj/secrets/cf_tunnel_token ]; then cp -f /proj/secrets/cf_tunnel_token /proj/secrets/cf/; chmod 0600 /proj/secrets/cf_tunnel_token; fi
+        chown -R 65532:65532 /proj/secrets/cf
+        chmod 0500 /proj/secrets/cf
+        chmod 0400 /proj/secrets/cf/* 2>/dev/null || true
+    volumes:
+      - .:/proj
+
+  mcp:
+    image: nas-mcp-server:1
+    build: ./app
+    restart: unless-stopped
+    user: "10001:10001"
+    depends_on:
+      fixperms: {condition: service_completed_successfully}
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}                     # e.g. mcp.example.com
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN} # e.g. myteam.cloudflareaccess.com
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD}                 # AUD tag of the Access application
+      ALLOWED_EMAILS: ${ALLOWED_EMAILS}               # comma separated
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./data:/data
+    networks: [edge]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.0
+    restart: unless-stopped
+    user: "65532:65532"
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN_FILE: /run/secrets/cf_tunnel_token
+    depends_on:
+      mcp: {condition: service_healthy}
+    volumes:
+      - ./secrets/cf:/run/secrets:ro
+    networks: [edge]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}
